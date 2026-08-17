@@ -423,7 +423,10 @@ export async function syncPrices(
     rawData = (await res.json()) as Record<string, unknown>;
   } catch (err: unknown) {
     if (err instanceof DOMException && err.name === 'AbortError') {
-      throw new Error('价格源请求超时，请稍后重试');
+      // tsconfig 目标为 ES2020，Error 构造函数的 cause 选项属于 ES2022，改用属性赋值。
+      const symptom: Error & { cause?: unknown } = new Error('价格源请求超时，请稍后重试');
+      symptom.cause = err;
+      throw symptom;
     }
     throw err;
   } finally {
