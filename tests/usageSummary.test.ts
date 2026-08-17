@@ -3,6 +3,8 @@ import {
   buildUsageSnapshotFromSummary,
   computeKeyStatsFromSummary,
   normalizeSummaryResponse,
+  filterSummaryBucketsByWindow,
+  summaryBucketStartMs,
   summaryGroupKey,
   summaryLatency,
   summaryTtft,
@@ -193,5 +195,57 @@ describe('normalizeSummaryResponse', () => {
     expect(parsed.buckets[0].requests).toBe(0);
     expect(parsed.buckets[0].avg_latency_ms).toBe(0);
     expect(parsed.buckets[0].tokens.input_tokens).toBe(0);
+  });
+});
+
+describe('summaryBucketStartMs', () => {
+  test('parses every bucket granularity as UTC', () => {
+    expect(summaryBucketStartMs('2026-05')).toBe(Date.parse('2026-05-01T00:00:00Z'));
+    expect(summaryBucketStartMs('2026-05-02')).toBe(Date.parse('2026-05-02T00:00:00Z'));
+    expect(summaryBucketStartMs('2026-05-02T10')).toBe(Date.parse('2026-05-02T10:00:00Z'));
+    expect(summaryBucketStartMs('2026-05-02T10:30')).toBe(Date.parse('2026-05-02T10:30:00Z'));
+  });
+
+  test('returns NaN for anything it does not recognise', () => {
+    expect(Number.isNaN(summaryBucketStartMs(''))).toBe(true);
+    expect(Number.isNaN(summaryBucketStartMs('nonsense'))).toBe(true);
+  });
+});
+
+describe('filterSummaryBucketsByWindow', () => {
+  // Regression: the aggregate snapshot has no per-request details, so the old
+  // detail-walking filter rebuilt every total as zero and blanked the dashboard.
+  // Time filtering has to happen on the buckets, before the snapshot is built.
+  const buckets = [
+    bucket({ bucket: '2026-05-01T08', requests: 1 }),
+    bucket({ bucket: '2026-05-02T08', requests: 2 }),
+    bucket({ bucket: '2026-05-03T08', requests: 4 }),
+  ];
+
+  test('keeps only buckets inside the window', () => {
+    const start = Date.parse('2026-05-02T00:00:00Z');
+    const end = Date.parse('2026-05-03T23:59:59Z');
+    const kept = filterSummaryBucketsByWindow(buckets, start, end);
+    expect(kept.map((b) => b.bucket)).toEqual(['2026-05-02T08', '2026-05-03T08']);
+  });
+
+  test('a null start means no lower bound', () => {
+    expect(filterSummaryBucketsByWindow(buckets, null, Date.now())).toHaveLength(3);
+  });
+
+  test('keeps unparseable buckets rather than silently dropping data', () => {
+    const odd = [...buckets, bucket({ bucket: 'garbage', requests: 8 })];
+    const kept = filterSummaryBucketsByWindow(odd, Date.parse('2099-01-01T00:00:00Z'), Date.now());
+    expect(kept.map((b) => b.bucket)).toEqual(['garbage']);
+  });
+
+  test('filtered buckets rebuild into a correct snapshot', () => {
+    const start = Date.parse('2026-05-02T00:00:00Z');
+    const end = Date.parse('2026-05-03T23:59:59Z');
+    const snapshot = buildUsageSnapshotFromSummary(
+      filterSummaryBucketsByWindow(buckets, start, end)
+    );
+    // 2 + 4, not 1 + 2 + 4, and crucially not 0.
+    expect(snapshot.total_requests).toBe(6);
   });
 });

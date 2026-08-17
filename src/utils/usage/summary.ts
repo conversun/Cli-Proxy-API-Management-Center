@@ -262,3 +262,46 @@ export const summaryTtft = (bucket: UsageSummaryBucket) => ({
   avg: bucket.avg_ttft_ms,
   samples: bucket.ttft_samples,
 });
+
+/**
+ * 把桶键解析回时间戳（UTC）。支持四种粒度：
+ *   2026-05            月
+ *   2026-05-02         日
+ *   2026-05-02T10      小时
+ *   2026-05-02T10:30   季度小时
+ * 无法识别时返回 NaN，由调用方决定如何处理。
+ */
+export const summaryBucketStartMs = (bucket: string): number => {
+  const raw = bucket.trim();
+  if (!raw) return Number.NaN;
+  let iso: string;
+  if (raw.length === 7) iso = `${raw}-01T00:00:00Z`;
+  else if (raw.length === 10) iso = `${raw}T00:00:00Z`;
+  else if (raw.length === 13) iso = `${raw}:00:00Z`;
+  else if (raw.length === 16) iso = `${raw}:00Z`;
+  else return Number.NaN;
+  return Date.parse(iso);
+};
+
+/**
+ * 按时间窗口筛选聚合桶。
+ *
+ * 聚合后的快照无法再按时间切片 —— apis/models 的总数已经跨时间加完了。
+ * 所以需要按时间过滤时，必须先筛桶再重建快照，而不是去过滤快照本身。
+ *
+ * 桶以其起始时刻参与比较：一个横跨窗口边界的桶会被整个保留或整个丢弃，
+ * 这是聚合固有的精度损失；桶越细损失越小。
+ */
+export const filterSummaryBucketsByWindow = (
+  buckets: UsageSummaryBucket[],
+  startMs: number | null,
+  endMs: number
+): UsageSummaryBucket[] => {
+  if (startMs === null) return buckets;
+  return buckets.filter((bucket) => {
+    const ms = summaryBucketStartMs(bucket.bucket);
+    // 解析不出时宁可保留：宁愿多显示也不要因为格式意外而静默丢数据。
+    if (Number.isNaN(ms)) return true;
+    return ms >= startMs && ms <= endMs;
+  });
+};

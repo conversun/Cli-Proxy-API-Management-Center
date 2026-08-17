@@ -36,7 +36,8 @@ import { MonitorTrendChart } from '@/components/monitor/MonitorTrendChart';
 import { ModelUsageDistributionCard } from '@/components/monitor/ModelUsageDistributionCard';
 import { MonitorApiKeyStatsCard } from '@/components/monitor/MonitorApiKeyStatsCard';
 import {
-  filterUsageByTimeRange,
+  buildUsageSnapshotFromSummary,
+  filterSummaryBucketsByWindow,
   getModelNamesFromUsage,
   getModelStats,
   type UsageTimeRange
@@ -45,7 +46,8 @@ import {
   DEFAULT_USAGE_TIME_RANGE,
   HOUR_WINDOW_BY_USAGE_TIME_RANGE,
   USAGE_TIME_RANGE_OPTIONS,
-  isUsageTimeRange
+  isUsageTimeRange,
+  usageTimeRangeToMs
 } from '@/utils/usageTimeRange';
 import { useUsageStatsStore } from '@/stores/useUsageStatsStore';
 import styles from './MonitoringCenterPage.module.scss';
@@ -103,6 +105,8 @@ export function MonitoringCenterPage() {
   // 表格才需要逐条记录（TPS、首字延迟、失败日志、单条删除）。
   const usageRecords = useUsageStatsStore((state) => state.records);
   const loadUsageRecords = useUsageStatsStore((state) => state.loadUsageRecords);
+  // 原始聚合桶：按时间窗口筛选时必须从它重建，快照本身已无时间维度。
+  const summaryBuckets = useUsageStatsStore((state) => state.summaryBuckets);
 
   const loadAuthFiles = useCallback(async () => {
     const res = await authFilesApi.list();
@@ -139,10 +143,20 @@ export function MonitoringCenterPage() {
     }
   }, [timeRange]);
 
-  const filteredUsage = useMemo(
-    () => (usage ? filterUsageByTimeRange(usage, timeRange) : null),
-    [usage, timeRange]
-  );
+  // 聚合快照的 apis/models 总数已经跨时间加完了，无法再按时间切片。按时间
+  // 过滤必须先筛聚合桶再重建快照，而不是去过滤快照本身。
+  const filteredUsage = useMemo(() => {
+    if (!usage) return null;
+    if (timeRange === 'all') return usage;
+    // 锚在数据拓取时刻而非渲染时刻：store 就是按这个时间取的范围，
+    // 用 Date.now() 会让过滤窗口随渲染漂移，且在 useMemo 里不纯。
+    const endMs = lastRefreshedAt ? lastRefreshedAt.getTime() : 0;
+    if (!endMs) return usage;
+    const startMs = endMs - usageTimeRangeToMs(timeRange);
+    return buildUsageSnapshotFromSummary(
+      filterSummaryBucketsByWindow(summaryBuckets, startMs, endMs)
+    );
+  }, [lastRefreshedAt, summaryBuckets, timeRange, usage]);
   const hourWindowHours =
     timeRange === 'all' ? undefined : HOUR_WINDOW_BY_USAGE_TIME_RANGE[timeRange];
   const rateWindowMinutes = useMemo(() => {

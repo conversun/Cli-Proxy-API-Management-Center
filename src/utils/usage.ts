@@ -35,6 +35,8 @@ export {
   computeKeyStatsFromSummary,
   normalizeSummaryResponse,
   summaryGroupKey,
+  filterSummaryBucketsByWindow,
+  summaryBucketStartMs,
   summaryLatency,
   summaryTtft,
   weightedAverage,

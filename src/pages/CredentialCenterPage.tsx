@@ -9,11 +9,17 @@ import { useUsageData, type UsagePayload } from '@/components/usage';
 import { useHeaderRefresh } from '@/hooks/useHeaderRefresh';
 import { authFilesApi } from '@/services/api/authFiles';
 import type { AuthFileItem } from '@/types/authFile';
-import { filterUsageByTimeRange, type UsageTimeRange } from '@/utils/usage';
+import {
+  buildUsageSnapshotFromSummary,
+  filterSummaryBucketsByWindow,
+  type UsageTimeRange
+} from '@/utils/usage';
+import { useUsageStatsStore } from '@/stores/useUsageStatsStore';
 import {
   DEFAULT_USAGE_TIME_RANGE,
   USAGE_TIME_RANGE_OPTIONS,
-  isUsageTimeRange
+  isUsageTimeRange,
+  usageTimeRangeToMs
 } from '@/utils/usageTimeRange';
 import styles from './CredentialCenterPage.module.scss';
 
@@ -48,6 +54,9 @@ export function CredentialCenterPage() {
     refreshFullRange: true
   });
   const [authFiles, setAuthFiles] = useState<AuthFileItem[]>([]);
+  // store 取的是 timeRange 与 lookback 中更宽的那个范围，所以这里确实需要收窄；
+  // 而聚合快照已无时间维度，必须从原始桶重建。
+  const summaryBuckets = useUsageStatsStore((state) => state.summaryBuckets);
 
   const loadAuthFiles = useCallback(async () => {
     const res = await authFilesApi.list();
@@ -80,10 +89,18 @@ export function CredentialCenterPage() {
     }
   }, [timeRange]);
 
-  const filteredUsage = useMemo(
-    () => (usage ? filterUsageByTimeRange(usage, timeRange) : null),
-    [usage, timeRange]
-  );
+  const filteredUsage = useMemo(() => {
+    if (!usage) return null;
+    if (timeRange === 'all') return usage;
+    // 锚在数据拓取时刻而非渲染时刻：store 就是按这个时间取的范围，
+    // 用 Date.now() 会让过滤窗口随渲染漂移，且在 useMemo 里不纯。
+    const endMs = lastRefreshedAt ? lastRefreshedAt.getTime() : 0;
+    if (!endMs) return usage;
+    const startMs = endMs - usageTimeRangeToMs(timeRange);
+    return buildUsageSnapshotFromSummary(
+      filterSummaryBucketsByWindow(summaryBuckets, startMs, endMs)
+    );
+  }, [lastRefreshedAt, summaryBuckets, timeRange, usage]);
 
   const handleTimeRangeChange = useCallback((range: UsageTimeRange) => {
     setTimeRange(range);
