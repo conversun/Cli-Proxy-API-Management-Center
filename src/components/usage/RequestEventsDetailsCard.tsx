@@ -25,6 +25,7 @@ import {
   extractTotalTokens,
   formatDurationMs,
   normalizeAuthIndex,
+  type UsageDetail,
   type UsageThinking,
 } from '@/utils/usage';
 import { downloadBlob } from '@/utils/download';
@@ -66,7 +67,16 @@ type RequestEventRow = {
 };
 
 export interface RequestEventsDetailsCardProps {
+  /**
+   * 聚合快照。仅在未传 records 时作为回退数据源（旧的全量拉取路径）；
+   * 走聚合接口时它不再携带逐条记录。
+   */
   usage: unknown;
+  /**
+   * 分页拉回的原始记录。传入时优先使用，避免为了渲染最多 500 行而把整个
+   * 时间范围的记录都下载一遍。
+   */
+  records?: UsageDetail[] | null;
   loading: boolean;
   geminiKeys: GeminiKeyConfig[];
   claudeConfigs: ProviderKeyConfig[];
@@ -187,6 +197,7 @@ const encodeCsv = (value: string | number): string => {
 
 export function RequestEventsDetailsCard({
   usage,
+  records,
   loading,
   geminiKeys,
   claudeConfigs,
@@ -332,7 +343,9 @@ export function RequestEventsDetailsCard({
       : null;
 
   const rows = useMemo<RequestEventRow[]>(() => {
-    const details = collectUsageDetails(usage);
+    // records 是服务端分页结果（已经是最新的那一页）；没有时回退到从聚合
+    // 快照里挖明细，保持旧调用方可用。
+    const details = records ?? collectUsageDetails(usage);
 
     const baseRows = details.map((detail, index) => {
       const timestamp = detail.timestamp;
@@ -453,7 +466,7 @@ export function RequestEventsDetailsCard({
         source: buildDisambiguatedSourceLabel(row),
       }))
       .sort((a, b) => b.timestampMs - a.timestampMs);
-  }, [authFileMap, i18n.language, sourceInfoMap, usage]);
+  }, [authFileMap, i18n.language, records, sourceInfoMap, usage]);
 
   const hasTimingData = useMemo(
     () => rows.some((row) => row.firstByteLatencyMs !== null || row.generationMs !== null),

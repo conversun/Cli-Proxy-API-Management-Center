@@ -47,6 +47,7 @@ import {
   USAGE_TIME_RANGE_OPTIONS,
   isUsageTimeRange
 } from '@/utils/usageTimeRange';
+import { useUsageStatsStore } from '@/stores/useUsageStatsStore';
 import styles from './MonitoringCenterPage.module.scss';
 
 ChartJS.register(
@@ -98,6 +99,11 @@ export function MonitoringCenterPage() {
   } = useUsageData({ timeRange });
   const [authFiles, setAuthFiles] = useState<AuthFileItem[]>([]);
 
+  // 明细表走服务端分页，与上面的聚合快照是两个独立数据源：图表只需要桶，
+  // 表格才需要逐条记录（TPS、首字延迟、失败日志、单条删除）。
+  const usageRecords = useUsageStatsStore((state) => state.records);
+  const loadUsageRecords = useUsageStatsStore((state) => state.loadUsageRecords);
+
   const loadAuthFiles = useCallback(async () => {
     const res = await authFilesApi.list();
     const files = Array.isArray(res) ? res : (res as { files?: AuthFileItem[] })?.files;
@@ -106,8 +112,12 @@ export function MonitoringCenterPage() {
   }, []);
 
   const handleRefresh = useCallback(async () => {
-    await Promise.all([loadUsage(), loadAuthFiles()]);
-  }, [loadAuthFiles, loadUsage]);
+    await Promise.all([loadUsage(), loadUsageRecords({ timeRange }), loadAuthFiles()]);
+  }, [loadAuthFiles, loadUsage, loadUsageRecords, timeRange]);
+
+  useEffect(() => {
+    void loadUsageRecords({ timeRange });
+  }, [loadUsageRecords, timeRange]);
 
   useHeaderRefresh(handleRefresh);
 
@@ -282,6 +292,7 @@ export function MonitoringCenterPage() {
       <div className={styles.fullWidthSection}>
         <RequestEventsDetailsCard
           usage={filteredUsage}
+          records={usageRecords}
           loading={loading}
           geminiKeys={config?.geminiApiKeys || []}
           claudeConfigs={config?.claudeApiKeys || []}

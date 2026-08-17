@@ -2,22 +2,32 @@ import { create } from 'zustand';
 import { usageApi } from '@/services/api/usage';
 import { useAuthStore } from '@/stores/useAuthStore';
 import {
-  buildUsageSnapshotFromDetails,
-  collectUsageDetailsWithEndpoint,
-  computeKeyStatsFromDetails,
-  normalizeAuthIndex,
-  normalizeUsageData,
+  buildUsageSnapshotFromSummary,
+  computeKeyStatsFromSummary,
+  normalizeSummaryResponse,
   type KeyStats,
   type UsageDetail,
-  type UsageDetailWithEndpoint,
   type UsageStatsSnapshot,
+  type UsageSummaryBucket,
+  type UsageSummaryBucketSize,
   type UsageTimeRange,
 } from '@/utils/usage';
 import i18n from '@/i18n';
 
 export const USAGE_STATS_STALE_TIME_MS = 240_000;
 
-const USAGE_REFRESH_LOOKBACK_MS = 2 * 60 * 60 * 1000;
+/**
+ * 明细表最多渲染 500 行，所以一次取满即可，不必把整个时间范围的原始记录拉回来。
+ * 旧实现会下载范围内的全部记录再切片，7 天窗口实测 4.35 MB / 7380 条。
+ */
+export const USAGE_RECORDS_PAGE_SIZE = 500;
+
+/**
+ * 小时桶只在范围不太宽时才请求：日桶无法还原小时曲线，而用小时桶覆盖一个月会把
+ * 桶数放大 24 倍且没有对应的图表消费它。
+ */
+const HOURLY_BUCKET_MAX_SPAN_MS = 8 * 24 * 60 * 60 * 1000;
+
 const USAGE_RANGE_MS: Record<Exclude<UsageTimeRange, 'all'>, number> = {
   '7h': 7 * 60 * 60 * 1000,
   '24h': 24 * 60 * 60 * 1000,
@@ -27,29 +37,38 @@ const USAGE_RANGE_MS: Record<Exclude<UsageTimeRange, 'all'>, number> = {
 
 export type LoadUsageStatsOptions = {
   force?: boolean;
+  /** 保留以兼容既有调用方；聚合请求总是覆盖完整目标范围，无需增量拼接。 */
   fullRange?: boolean;
   staleTimeMs?: number;
   timeRange?: UsageTimeRange;
   minimumLookbackMs?: number;
 };
 
-type UsageLoadedRange = {
-  startMs: number | null;
-  endMs: number;
+export type LoadUsageRecordsOptions = {
+  timeRange?: UsageTimeRange;
+  minimumLookbackMs?: number;
+  limit?: number;
 };
 
 type UsageStatsState = {
   usage: UsageStatsSnapshot | null;
   keyStats: KeyStats;
-  usageDetails: UsageDetail[];
-  usageDetailsByKey: Record<string, UsageDetailWithEndpoint>;
-  loadedRanges: UsageLoadedRange[];
-  deletedUsageIds: Record<string, true>;
+  summaryBuckets: UsageSummaryBucket[];
+  summaryTruncated: boolean;
   loading: boolean;
   error: string | null;
   lastRefreshedAt: number | null;
   scopeKey: string;
+
+  /** 明细表数据源，独立于聚合快照。 */
+  records: UsageDetail[];
+  recordsLoading: boolean;
+  recordsError: string | null;
+  recordsHasMore: boolean;
+  recordsCursor: string | null;
+
   loadUsageStats: (options?: LoadUsageStatsOptions) => Promise<void>;
+  loadUsageRecords: (options?: LoadUsageRecordsOptions) => Promise<void>;
   deleteUsageRecords: (ids: string[]) => Promise<void>;
   clearUsageStats: () => void;
 };
@@ -57,7 +76,7 @@ type UsageStatsState = {
 const createEmptyKeyStats = (): KeyStats => ({ bySource: {}, byAuthIndex: {} });
 
 let usageRequestToken = 0;
-let inFlightUsageRequest: { id: number; scopeKey: string; requestKey: string; promise: Promise<void> } | null = null;
+let recordsRequestToken = 0;
 
 const getErrorMessage = (error: unknown) =>
   error instanceof Error
@@ -86,7 +105,9 @@ const getTargetStartMs = (
 
   const rangeStartMs = getRangeStartMs(timeRange, nowMs);
   const minimumStartMs =
-    typeof minimumLookbackMs === 'number' && Number.isFinite(minimumLookbackMs) && minimumLookbackMs > 0
+    typeof minimumLookbackMs === 'number' &&
+    Number.isFinite(minimumLookbackMs) &&
+    minimumLookbackMs > 0
       ? nowMs - minimumLookbackMs
       : null;
 
@@ -95,263 +116,132 @@ const getTargetStartMs = (
   return Math.min(rangeStartMs, minimumStartMs);
 };
 
-const getLatestLoadedEndMs = (ranges: UsageLoadedRange[]): number | null => {
-  if (!ranges.length) return null;
-  return Math.max(...ranges.map((range) => range.endMs));
+const rangeToParams = (startMs: number | null, endMs: number) =>
+  startMs === null ? {} : { start: toIsoString(startMs), end: toIsoString(endMs) };
+
+const bucketForSpan = (startMs: number | null, endMs: number): UsageSummaryBucketSize => {
+  if (startMs === null) return 'day';
+  return endMs - startMs <= HOURLY_BUCKET_MAX_SPAN_MS ? 'hour' : 'day';
 };
 
-const getEarliestConcreteStartMs = (ranges: UsageLoadedRange[]): number | null => {
-  const starts = ranges
-    .map((range) => range.startMs)
-    .filter((startMs): startMs is number => typeof startMs === 'number');
-  if (!starts.length) return null;
-  return Math.min(...starts);
-};
-
-const hasFullRange = (ranges: UsageLoadedRange[]): boolean =>
-  ranges.some((range) => range.startMs === null);
-
-const hasStartCoverage = (ranges: UsageLoadedRange[], targetStartMs: number | null): boolean => {
-  if (!ranges.length) return false;
-  if (hasFullRange(ranges)) return true;
-  if (targetStartMs === null) return false;
-  const earliest = getEarliestConcreteStartMs(ranges);
-  return earliest !== null && earliest <= targetStartMs;
-};
-
-const mergeLoadedRanges = (ranges: UsageLoadedRange[]): UsageLoadedRange[] => {
-  if (!ranges.length) return [];
-  const latestEnd = getLatestLoadedEndMs(ranges) ?? Date.now();
-  if (hasFullRange(ranges)) {
-    return [{ startMs: null, endMs: latestEnd }];
-  }
-
-  const sorted = ranges
-    .filter((range): range is { startMs: number; endMs: number } => range.startMs !== null)
-    .sort((a, b) => a.startMs - b.startMs);
-  const merged: UsageLoadedRange[] = [];
-
-  sorted.forEach((range) => {
-    const last = merged[merged.length - 1];
-    if (!last || last.startMs === null || range.startMs > last.endMs + 1) {
-      merged.push({ ...range });
-      return;
-    }
-    last.endMs = Math.max(last.endMs, range.endMs);
-  });
-
-  return merged;
-};
-
-const resolveRequestRanges = (
-  state: UsageStatsState,
-  targetStartMs: number | null,
-  nowMs: number,
-  force: boolean,
-  fresh: boolean
-): UsageLoadedRange[] => {
-  if (!state.loadedRanges.length) {
-    return [{ startMs: targetStartMs, endMs: nowMs }];
-  }
-
-  const latestEnd = getLatestLoadedEndMs(state.loadedRanges) ?? nowMs;
-  const ranges: UsageLoadedRange[] = [];
-
-  if (targetStartMs === null) {
-    if (!hasFullRange(state.loadedRanges)) {
-      return [{ startMs: null, endMs: nowMs }];
-    }
-    if (force || !fresh) {
-      ranges.push({ startMs: Math.max(0, latestEnd - USAGE_REFRESH_LOOKBACK_MS), endMs: nowMs });
-    }
-    return ranges;
-  }
-
-  if (!hasFullRange(state.loadedRanges)) {
-    const earliestStart = getEarliestConcreteStartMs(state.loadedRanges);
-    if (earliestStart === null || targetStartMs < earliestStart) {
-      ranges.push({ startMs: targetStartMs, endMs: Math.min(earliestStart ?? nowMs, nowMs) });
-    }
-  }
-
-  if (force || !fresh) {
-    ranges.push({
-      startMs: Math.max(targetStartMs, latestEnd - USAGE_REFRESH_LOOKBACK_MS),
-      endMs: nowMs,
-    });
-  }
-
-  return ranges.filter((range) => range.startMs === null || range.endMs > range.startMs);
-};
-
-const usageRangeToParams = (range: UsageLoadedRange) => {
-  if (range.startMs === null) {
-    return undefined;
-  }
-  return {
-    start: toIsoString(range.startMs),
-    end: toIsoString(range.endMs),
-  };
-};
-
-const getUsageDetailCacheKey = (detail: UsageDetailWithEndpoint): string => {
-  if (detail.id) {
-    return `id:${detail.id}`;
-  }
-
-  return [
-    'synthetic',
-    detail.__endpoint,
-    detail.__modelName ?? '',
-    detail.timestamp,
-    detail.source,
-    normalizeAuthIndex(detail.auth_index) ?? '',
-    detail.tokens.input_tokens,
-    detail.tokens.output_tokens,
-    detail.tokens.reasoning_tokens,
-    detail.tokens.cached_tokens,
-    detail.failed ? '1' : '0',
-  ].join('|');
-};
-
-const buildDerivedState = (usageDetailsByKey: Record<string, UsageDetailWithEndpoint>) => {
-  const usageDetails = Object.values(usageDetailsByKey).sort(
-    (a, b) => (b.__timestampMs ?? 0) - (a.__timestampMs ?? 0)
-  );
-  return {
-    usage: buildUsageSnapshotFromDetails(usageDetails),
-    keyStats: computeKeyStatsFromDetails(usageDetails),
-    usageDetails,
-  };
-};
-
-const extractUsageDetailsFromResponse = (response: unknown): UsageDetailWithEndpoint[] => {
-  const usage = normalizeUsageData(response);
-  return collectUsageDetailsWithEndpoint(usage);
+const getScopeKey = (): string => {
+  const { apiBase = '', managementKey = '' } = useAuthStore.getState();
+  return `${apiBase}::${managementKey}`;
 };
 
 export const useUsageStatsStore = create<UsageStatsState>((set, get) => ({
   usage: null,
   keyStats: createEmptyKeyStats(),
-  usageDetails: [],
-  usageDetailsByKey: {},
-  loadedRanges: [],
-  deletedUsageIds: {},
+  summaryBuckets: [],
+  summaryTruncated: false,
   loading: false,
   error: null,
   lastRefreshedAt: null,
   scopeKey: '',
 
+  records: [],
+  recordsLoading: false,
+  recordsError: null,
+  recordsHasMore: false,
+  recordsCursor: null,
+
   loadUsageStats: async (options = {}) => {
     const force = options.force === true;
-    const fullRange = options.fullRange === true;
     const staleTimeMs = options.staleTimeMs ?? USAGE_STATS_STALE_TIME_MS;
     const nowMs = Date.now();
     const targetStartMs = getTargetStartMs(options.timeRange, nowMs, options.minimumLookbackMs);
-    const { apiBase = '', managementKey = '' } = useAuthStore.getState();
-    const scopeKey = `${apiBase}::${managementKey}`;
+    const scopeKey = getScopeKey();
     const state = get();
     const scopeChanged = state.scopeKey !== scopeKey;
-    const fresh =
+
+    if (
+      !force &&
       !scopeChanged &&
       state.lastRefreshedAt !== null &&
-      nowMs - state.lastRefreshedAt < staleTimeMs;
-
-    if (!force && !fullRange && fresh && hasStartCoverage(state.loadedRanges, targetStartMs)) {
+      nowMs - state.lastRefreshedAt < staleTimeMs
+    ) {
       return;
     }
 
     if (scopeChanged) {
-      usageRequestToken += 1;
-      inFlightUsageRequest = null;
       set({
         usage: null,
         keyStats: createEmptyKeyStats(),
-        usageDetails: [],
-        usageDetailsByKey: {},
-        loadedRanges: [],
-        deletedUsageIds: {},
+        summaryBuckets: [],
+        summaryTruncated: false,
+        records: [],
+        recordsHasMore: false,
+        recordsCursor: null,
         error: null,
         lastRefreshedAt: null,
         scopeKey,
       });
     }
 
-    const requestState = scopeChanged ? get() : state;
-    const requestRanges = fullRange
-      ? [{ startMs: targetStartMs, endMs: nowMs }]
-      : resolveRequestRanges(requestState, targetStartMs, nowMs, force, fresh);
-
-    if (!requestRanges.length) {
-      set({ lastRefreshedAt: nowMs, scopeKey });
-      return;
-    }
-
-    const requestKey = `${scopeKey}::${fullRange ? 'full' : 'incremental'}::${requestRanges
-      .map((range) => `${range.startMs ?? 'all'}-${range.endMs}`)
-      .join(',')}`;
-
-    if (inFlightUsageRequest && inFlightUsageRequest.scopeKey === scopeKey && inFlightUsageRequest.requestKey === requestKey) {
-      await inFlightUsageRequest.promise;
-      return;
-    }
-
     const requestId = (usageRequestToken += 1);
     set({ loading: true, error: null, scopeKey });
 
-    const requestPromise = (async () => {
-      try {
-        const responses = await Promise.all(
-          requestRanges.map((range) => usageApi.getUsage(usageRangeToParams(range)))
-        );
+    try {
+      const response = await usageApi.getSummary({
+        ...rangeToParams(targetStartMs, nowMs),
+        bucket: bucketForSpan(targetStartMs, nowMs),
+      });
 
-        if (requestId !== usageRequestToken) return;
+      // 请求期间作用域切换或有更新的请求发出时，丢弃这份已过期的结果。
+      if (requestId !== usageRequestToken) return;
 
-        const currentState = get();
-        const nextDetailsByKey: Record<string, UsageDetailWithEndpoint> = fullRange
-          ? {}
-          : { ...currentState.usageDetailsByKey };
-        const deletedUsageIds = currentState.deletedUsageIds;
+      const summary = normalizeSummaryResponse(response);
+      set({
+        usage: buildUsageSnapshotFromSummary(summary.buckets),
+        keyStats: computeKeyStatsFromSummary(summary.buckets),
+        summaryBuckets: summary.buckets,
+        summaryTruncated: summary.truncated,
+        loading: false,
+        error: null,
+        lastRefreshedAt: Date.now(),
+        scopeKey,
+      });
+    } catch (error: unknown) {
+      if (requestId !== usageRequestToken) return;
+      const message = getErrorMessage(error);
+      set({ loading: false, error: message, scopeKey });
+      // tsconfig 目标为 ES2020，Error 构造函数的 cause 选项是 ES2022 才有的，
+      // 因此改用属性赋值挂上原始错误，不为此抬高全局 target。
+      const symptom: Error & { cause?: unknown } = new Error(message);
+      symptom.cause = error;
+      throw symptom;
+    }
+  },
 
-        responses.forEach((response) => {
-          extractUsageDetailsFromResponse(response).forEach((detail) => {
-            if (detail.id && deletedUsageIds[detail.id]) {
-              return;
-            }
-            nextDetailsByKey[getUsageDetailCacheKey(detail)] = detail;
-          });
-        });
+  loadUsageRecords: async (options = {}) => {
+    const nowMs = Date.now();
+    const targetStartMs = getTargetStartMs(options.timeRange, nowMs, options.minimumLookbackMs);
+    const scopeKey = getScopeKey();
+    const requestId = (recordsRequestToken += 1);
+    set({ recordsLoading: true, recordsError: null });
 
-        const derived = buildDerivedState(nextDetailsByKey);
-        set({
-          ...derived,
-          usageDetailsByKey: nextDetailsByKey,
-          loadedRanges: fullRange
-            ? mergeLoadedRanges(requestRanges)
-            : mergeLoadedRanges([...currentState.loadedRanges, ...requestRanges]),
-          loading: false,
-          error: null,
-          lastRefreshedAt: Date.now(),
-          scopeKey,
-        });
-      } catch (error: unknown) {
-        if (requestId !== usageRequestToken) return;
-        const message = getErrorMessage(error);
-        set({
-          loading: false,
-          error: message,
-          scopeKey,
-        });
-        throw new Error(message);
-      } finally {
-        if (inFlightUsageRequest?.id === requestId) {
-          inFlightUsageRequest = null;
-        }
-      }
-    })();
+    try {
+      const page = await usageApi.getRecords({
+        ...rangeToParams(targetStartMs, nowMs),
+        // 倒序：表格要的是最新的记录，升序分页得把整个范围翻完才能到达。
+        order: 'desc',
+        limit: options.limit ?? USAGE_RECORDS_PAGE_SIZE,
+      });
 
-    inFlightUsageRequest = { id: requestId, scopeKey, requestKey, promise: requestPromise };
-    await requestPromise;
+      if (requestId !== recordsRequestToken) return;
+
+      set({
+        records: Array.isArray(page?.records) ? page.records : [],
+        recordsHasMore: page?.has_more === true,
+        recordsCursor: page?.next_cursor ?? null,
+        recordsLoading: false,
+        recordsError: null,
+        scopeKey,
+      });
+    } catch (error: unknown) {
+      if (requestId !== recordsRequestToken) return;
+      set({ recordsLoading: false, recordsError: getErrorMessage(error) });
+    }
   },
 
   deleteUsageRecords: async (ids: string[]) => {
@@ -360,37 +250,34 @@ export const useUsageStatsStore = create<UsageStatsState>((set, get) => ({
 
     await usageApi.deleteUsage(uniqueIds);
 
-    set((state) => {
-      const idSet = new Set(uniqueIds);
-      const usageDetailsByKey = Object.fromEntries(
-        Object.entries(state.usageDetailsByKey).filter(([, detail]) => !detail.id || !idSet.has(detail.id))
-      ) as Record<string, UsageDetailWithEndpoint>;
-      const deletedUsageIds = { ...state.deletedUsageIds };
-      uniqueIds.forEach((id) => {
-        deletedUsageIds[id] = true;
-      });
-      return {
-        ...buildDerivedState(usageDetailsByKey),
-        usageDetailsByKey,
-        deletedUsageIds,
-      };
-    });
+    const idSet = new Set(uniqueIds);
+    set((state) => ({
+      records: state.records.filter((record) => !record.id || !idSet.has(record.id)),
+    }));
+
+    // 聚合是服务端算的，本地删几行不会改变它；强制重取以免统计与明细对不上。
+    await get()
+      .loadUsageStats({ force: true })
+      .catch(() => {});
   },
 
   clearUsageStats: () => {
     usageRequestToken += 1;
-    inFlightUsageRequest = null;
+    recordsRequestToken += 1;
     set({
       usage: null,
       keyStats: createEmptyKeyStats(),
-      usageDetails: [],
-      usageDetailsByKey: {},
-      loadedRanges: [],
-      deletedUsageIds: {},
+      summaryBuckets: [],
+      summaryTruncated: false,
       loading: false,
       error: null,
       lastRefreshedAt: null,
       scopeKey: '',
+      records: [],
+      recordsLoading: false,
+      recordsError: null,
+      recordsHasMore: false,
+      recordsCursor: null,
     });
   },
 }));

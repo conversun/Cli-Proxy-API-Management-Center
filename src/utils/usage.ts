@@ -24,6 +24,21 @@ export {
   extractLatencyMs,
   formatDurationMs,
 } from './usage/latency';
+export type {
+  UsageSummaryBucket,
+  UsageSummaryBucketSize,
+  UsageSummaryResponse,
+  UsageSummaryTokens,
+} from './usage/summary';
+export {
+  buildUsageSnapshotFromSummary,
+  computeKeyStatsFromSummary,
+  normalizeSummaryResponse,
+  summaryGroupKey,
+  summaryLatency,
+  summaryTtft,
+  weightedAverage,
+} from './usage/summary';
 
 export interface KeyStatBucket {
   success: number;
